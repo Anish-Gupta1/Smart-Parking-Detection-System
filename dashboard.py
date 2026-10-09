@@ -14,6 +14,27 @@ from slot_manager import (
     count_statuses,
     canvas_to_normalized_slots,
 )
+from queue_manager import (
+    add_to_queue,
+    get_queue,
+    get_active_queue,
+    get_notification_history,
+    get_waiting_count,
+    remove_from_queue,
+    claim_next_waiting_driver,
+    mark_driver_notified,
+    mark_driver_failed,
+    retry_failed_driver,
+    get_last_successful_notification,
+)
+from email_service import (
+    send_parking_notification_async,
+    get_gmail_status,
+    log_gmail_env_status,
+)
+
+# Server-side environment diagnostic log on startup
+log_gmail_env_status()
 
 # ── Page config ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="Smart Parking System", layout="wide")
@@ -149,6 +170,182 @@ def display_stats(counts):
     c2.metric("🟢 Free", counts["free"])
     c3.metric("🔴 Occupied", counts["occupied"])
     c4.metric("🟠 Uncertain", counts["uncertain"])
+
+
+def render_waiting_queue_ui(current_free_slots=None):
+    """Render the Driver Waiting Queue Management and Gmail Notification UI."""
+    st.markdown("---")
+    st.subheader("📋 Driver Waiting Queue & Gmail Notifications")
+
+    # Diagnostic Gmail status check
+    gmail_status = get_gmail_status()
+    if gmail_status["configured"]:
+        st.success(
+            f"🟢 **Gmail Service Connected** ({gmail_status['method'].upper()}) — "
+            f"Sender: `{gmail_status['sender_email']}`"
+        )
+    else:
+        st.warning(
+            f"⚠️ **Gmail Service Not Configured:** {gmail_status['status_message']}\n\n"
+            "Drivers can be added to the queue, but automated emails will fail until valid credentials "
+            "are set in `.env`.\n\n"
+            "👉 **Quick Setup:** Generate a 16-character App Password at "
+            "[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) and set "
+            "`GMAIL_APP_PASSWORD=your_actual_password` in `.env`."
+        )
+
+    active_queue = get_active_queue()
+    history = get_notification_history()
+    last_verified = get_last_successful_notification()
+
+    waiting_count = sum(1 for e in active_queue if e.get("status") == "waiting")
+    failed_count = sum(1 for e in active_queue if e.get("status") == "failed")
+    notified_count = len(history)
+
+    # Metrics summary row
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("👥 Drivers Waiting", waiting_count)
+    if current_free_slots is not None:
+        m2.metric("🟢 Free Spaces", current_free_slots)
+    else:
+        m2.metric("🟢 Free Spaces", "Pending Detection")
+    m3.metric("✉️ Successfully Notified", notified_count)
+    m4.metric("⚠️ Failed / Retries", failed_count)
+
+    # Last Verified Successful Notification Banner
+    if last_verified:
+        st.info(
+            f"🔔 **Last Verified Notification:** Driver **{last_verified['email']}** "
+            f"({last_verified['queue_id']}) assigned to **{last_verified['slot_id']}** at {last_verified['timestamp']}"
+        )
+
+    # Informational availability state
+    if current_free_slots is not None:
+        if current_free_slots == 0:
+            st.warning(
+                "⚠️ **Parking Lot is Full (0 free spaces).** Drivers added to the queue will be automatically "
+                "notified via Gmail in FIFO order when a space becomes vacant."
+            )
+        elif current_free_slots > 0 and waiting_count > 0:
+            st.info(
+                f"ℹ️ **{current_free_slots} space(s) available.** Live webcam monitoring will automatically "
+                "notify waiting drivers when vacancy events occur."
+            )
+
+    # Form to add driver to waiting queue
+    st.markdown("##### ➕ Add Driver to Waiting Queue")
+    with st.form("queue_add_driver_form", clear_on_submit=True):
+        col_in1, col_in2 = st.columns([3, 1])
+        with col_in1:
+            driver_email_input = st.text_input(
+                "Driver Email Address",
+                placeholder="driver@example.com",
+                help="Enter a valid email address. The driver will receive an automated Gmail alert when a parking slot becomes vacant.",
+            )
+        with col_in2:
+            st.write("")
+            st.write("")
+            add_submitted = st.form_submit_button("➕ Add to Queue", type="primary", width="stretch")
+
+        if add_submitted:
+            if not driver_email_input or not driver_email_input.strip():
+                st.error("⚠️ Email address cannot be empty. Please enter a valid email.")
+            else:
+                ok, msg, _ = add_to_queue(driver_email_input.strip())
+                if ok:
+                    st.success(f"✅ {msg}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {msg}")
+
+    # Display Queue & History Tabs
+    tab_active, tab_history = st.tabs([
+        f"⏳ Active Waiting Queue ({len(active_queue)})",
+        f"📜 Notification History ({len(history)})",
+    ])
+
+    with tab_active:
+        if not active_queue:
+            st.info("ℹ️ The waiting queue is currently empty. No drivers waiting.")
+        else:
+            h0, h1, h2, h3, h4, h5, h6 = st.columns([0.8, 1.2, 2.6, 2.0, 1.8, 1.4, 1.8])
+            h0.markdown("**#**")
+            h1.markdown("**Queue ID**")
+            h2.markdown("**Email**")
+            h3.markdown("**Added Time**")
+            h4.markdown("**Status**")
+            h5.markdown("**Slot**")
+            h6.markdown("**Actions**")
+            st.markdown("<hr style='margin: 4px 0 10px 0;'>", unsafe_allow_html=True)
+
+            waiting_seq = 1
+            for entry in active_queue:
+                qid = entry["queue_id"]
+                st_val = entry["status"]
+                retries = entry.get("retry_count", 0)
+
+                if st_val == "waiting":
+                    pos_text = f"#{waiting_seq}"
+                    waiting_seq += 1
+                    badge = "🟡 Waiting"
+                elif st_val == "processing":
+                    pos_text = "..."
+                    badge = "🔵 Notification Pending"
+                elif st_val == "failed":
+                    pos_text = "!"
+                    badge = f"🔴 Failed (Attempt #{retries})"
+                else:
+                    pos_text = "-"
+                    badge = st_val
+
+                r0, r1, r2, r3, r4, r5, r6 = st.columns([0.8, 1.2, 2.6, 2.0, 1.8, 1.4, 1.8])
+                r0.write(pos_text)
+                r1.code(qid)
+                r2.write(entry["email"])
+                r3.caption(entry["created_at"])
+                r4.write(badge)
+                r5.write(f"{entry['assigned_slot']}" if entry.get("assigned_slot") else "-")
+
+                with r6:
+                    act_c1, act_c2 = st.columns(2)
+                    with act_c1:
+                        if st.button("🗑️", key=f"q_del_{qid}", help=f"Remove {qid} from queue"):
+                            remove_from_queue(qid)
+                            st.rerun()
+                    with act_c2:
+                        if st_val == "failed":
+                            if st.button("🔁", key=f"q_ret_{qid}", help=f"Retry notifying {qid}"):
+                                retry_failed_driver(qid)
+                                st.rerun()
+
+                if entry.get("error_message"):
+                    st.caption(f"⚠️ **Delivery Error ({qid}):** {entry['error_message']}")
+
+    with tab_history:
+        if not history:
+            st.caption("No historical notification records yet.")
+        else:
+            hh1, hh2, hh3, hh4, hh5, hh6 = st.columns([1.2, 3.0, 1.6, 2.2, 2.0, 1.2])
+            hh1.markdown("**Queue ID**")
+            hh2.markdown("**Email**")
+            hh3.markdown("**Slot**")
+            hh4.markdown("**Notified Time**")
+            hh5.markdown("**Status**")
+            hh6.markdown("**Action**")
+            st.markdown("<hr style='margin: 4px 0 10px 0;'>", unsafe_allow_html=True)
+
+            for entry in history:
+                hqid = entry["queue_id"]
+                hr1, hr2, hr3, hr4, hr5, hr6 = st.columns([1.2, 3.0, 1.6, 2.2, 2.0, 1.2])
+                hr1.code(hqid)
+                hr2.write(entry["email"])
+                hr3.write(entry.get("assigned_slot", "-"))
+                hr4.caption(entry.get("notified_at", "-"))
+                hr5.write("🟢 Notification Sent")
+                with hr6:
+                    if st.button("🗑️", key=f"hist_del_{hqid}", help=f"Remove {hqid} from history"):
+                        remove_from_queue(hqid)
+                        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +516,11 @@ if mode == "Image Upload":
             st.session_state["detection_results"] = classified
 
             counts = count_statuses(classified)
+            st.session_state["last_free_count"] = counts["free"]
             display_stats(counts)
 
             result_img = draw_results(img_array, classified, vehicles, vehicle_confs)
-            st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+            st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), width="stretch")
 
             with st.expander("📊 Detailed Slot Occupancy Breakdown"):
                 for s in classified:
@@ -336,6 +534,10 @@ if mode == "Image Upload":
                     st.write(
                         f"Vehicle #{idx + 1}: box=({vx1}, {vy1}) → ({vx2}, {vy2}) | Confidence: {vconf:.1%}"
                     )
+
+        render_waiting_queue_ui(current_free_slots=st.session_state.get("last_free_count"))
+    else:
+        render_waiting_queue_ui(current_free_slots=None)
 
 
 # ======================================================================
@@ -432,6 +634,8 @@ elif mode == "Video Upload":
                         st.session_state["confirmed_slots"] = []
                         st.rerun()
 
+                render_waiting_queue_ui(current_free_slots=st.session_state.get("last_free_count"))
+
             # ── STEP B: PROCESS VIDEO FRAMES ─────────────────────────────
             else:
                 confirmed_slots_v = st.session_state.get("confirmed_slots", [])
@@ -448,10 +652,13 @@ elif mode == "Video Upload":
                         st.session_state["layout_confirmed"] = False
                         st.rerun()
 
+                render_waiting_queue_ui(current_free_slots=st.session_state.get("last_free_count"))
+
                 slots_px = slots_to_pixels(confirmed_slots_v, v_w, v_h)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
                 stats_placeholder = st.empty()
+                queue_summary_placeholder = st.empty()
                 frame_window = st.image([])
 
                 frame_count = 0
@@ -462,6 +669,7 @@ elif mode == "Video Upload":
                 # Temporal smoothing per slot
                 status_history = {s["id"]: [] for s in slots_px}
                 SMOOTH_WINDOW = 4
+                slot_prev_status = {s["id"]: None for s in slots_px}
 
                 while cap.isOpened():
                     ret, frame = cap.read()
@@ -501,22 +709,110 @@ elif mode == "Video Upload":
                         if len(status_history[sid]) > SMOOTH_WINDOW:
                             status_history[sid].pop(0)
                         recent = status_history[sid]
-                        s["status"] = max(set(recent), key=recent.count)
+                        smoothed_status = max(set(recent), key=recent.count)
+                        s["status"] = smoothed_status
+
+                        # Confirmed Vacancy Event Detection
+                        prev_st = slot_prev_status.get(sid)
+                        if prev_st == "occupied" and smoothed_status == "free":
+                            if get_waiting_count() > 0:
+                                slot_label = f"Slot #{sid}"
+                                claimed = claim_next_waiting_driver(slot_id=slot_label)
+                                if claimed:
+                                    qid = claimed["queue_id"]
+                                    driver_email = claimed["email"]
+
+                                    st.session_state["active_notification_event"] = {
+                                        "status": "pending",
+                                        "email": driver_email,
+                                        "slot_id": slot_label,
+                                        "queue_id": qid,
+                                        "timestamp": time.strftime("%H:%M:%S"),
+                                    }
+
+                                    def _make_handler(q_id_val, s_lbl, em):
+                                        def _cb(success, msg, _s, _q):
+                                            if success:
+                                                mark_driver_notified(q_id_val, s_lbl)
+                                                st.session_state["active_notification_event"] = {
+                                                    "status": "success",
+                                                    "email": em,
+                                                    "slot_id": s_lbl,
+                                                    "queue_id": q_id_val,
+                                                    "timestamp": time.strftime("%H:%M:%S"),
+                                                    "msg": msg,
+                                                }
+                                            else:
+                                                mark_driver_failed(q_id_val, msg)
+                                                st.session_state["active_notification_event"] = {
+                                                    "status": "failed",
+                                                    "email": em,
+                                                    "slot_id": s_lbl,
+                                                    "queue_id": q_id_val,
+                                                    "timestamp": time.strftime("%H:%M:%S"),
+                                                    "error": msg,
+                                                }
+                                        return _cb
+
+                                    send_parking_notification_async(
+                                        recipient_email=driver_email,
+                                        slot_id=slot_label,
+                                        queue_id=qid,
+                                        on_complete=_make_handler(qid, slot_label, driver_email),
+                                    )
+
+                        if len(recent) >= SMOOTH_WINDOW:
+                            slot_prev_status[sid] = smoothed_status
 
                     counts = count_statuses(classified)
+                    st.session_state["last_free_count"] = counts["free"]
 
                     with stats_placeholder.container():
                         display_stats(counts)
 
+                    waiting_now = get_waiting_count()
+                    notif_evt = st.session_state.get("active_notification_event")
+                    verified_last = get_last_successful_notification()
+
+                    with queue_summary_placeholder.container():
+                        q_info_col1, q_info_col2 = st.columns([1, 2])
+                        with q_info_col1:
+                            st.caption(f"👥 **Waiting Queue:** {waiting_now} driver(s) waiting")
+                        with q_info_col2:
+                            if notif_evt and notif_evt.get("status") == "pending":
+                                st.caption(
+                                    f"⏳ **Dispatching Email:** Notifying `{notif_evt['email']}` "
+                                    f"for **{notif_evt['slot_id']}**..."
+                                )
+                            elif notif_evt and notif_evt.get("status") == "failed":
+                                st.caption(
+                                    f"❌ **Notification Failed:** `{notif_evt['email']}`: "
+                                    f"{notif_evt['error']}"
+                                )
+                            elif notif_evt and notif_evt.get("status") == "success":
+                                st.caption(
+                                    f"🔔 **Notification Sent:** `{notif_evt['email']}` "
+                                    f"({notif_evt['queue_id']}) for **{notif_evt['slot_id']}** at {notif_evt['timestamp']}"
+                                )
+                            elif verified_last:
+                                st.caption(
+                                    f"🔔 **Last Notified:** `{verified_last['email']}` "
+                                    f"({verified_last['queue_id']}) for **{verified_last['slot_id']}** at {verified_last['timestamp']}"
+                                )
+                            else:
+                                st.caption("ℹ️ No notifications sent yet.")
+
                     result_frame = draw_results(frame, classified, vehicles, confs)
                     frame_window.image(
                         cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB),
-                        use_container_width=True,
+                        width="stretch",
                     )
 
                     time.sleep(0.02)
 
                 cap.release()
+    else:
+        render_waiting_queue_ui(current_free_slots=None)
 
 
 # ======================================================================
@@ -651,6 +947,8 @@ else:
                 else:
                     st.warning("⚠️ Please draw at least one slot before confirming.")
 
+        render_waiting_queue_ui(current_free_slots=st.session_state.get("last_free_count"))
+
     # ── STEP B: CONTINUOUS LIVE DETECTION ──────────────────────────────
     else:
         confirmed_slots_w = st.session_state.get("confirmed_slots", [])
@@ -668,6 +966,8 @@ else:
                 st.session_state["webcam_ref_frame"] = None
                 st.rerun()
 
+        render_waiting_queue_ui(current_free_slots=st.session_state.get("last_free_count"))
+
         st.markdown("---")
         run_stream = st.checkbox("▶️ Run Live Detection Stream", value=True)
 
@@ -684,6 +984,7 @@ else:
                 slots_px = slots_to_pixels(confirmed_slots_w, w_w, w_h)
 
                 stats_placeholder = st.empty()
+                queue_summary_placeholder = st.empty()
                 frame_window = st.image([])
 
                 frame_count = 0
@@ -692,6 +993,7 @@ else:
                 last_confs = []
                 status_history = {s["id"]: [] for s in slots_px}
                 SMOOTH_WINDOW = 3
+                slot_prev_status = {s["id"]: None for s in slots_px}
 
                 while run_stream:
                     ret, frame = cap.read()
@@ -730,16 +1032,103 @@ else:
                         if len(status_history[sid]) > SMOOTH_WINDOW:
                             status_history[sid].pop(0)
                         recent = status_history[sid]
-                        s["status"] = max(set(recent), key=recent.count)
+                        smoothed_status = max(set(recent), key=recent.count)
+                        s["status"] = smoothed_status
+
+                        # Confirmed Vacancy Event Detection:
+                        # Only trigger if the slot transitioned from confirmed occupied to free
+                        prev_st = slot_prev_status.get(sid)
+                        if prev_st == "occupied" and smoothed_status == "free":
+                            if get_waiting_count() > 0:
+                                slot_label = f"Slot #{sid}"
+                                claimed = claim_next_waiting_driver(slot_id=slot_label)
+                                if claimed:
+                                    qid = claimed["queue_id"]
+                                    driver_email = claimed["email"]
+
+                                    st.session_state["active_notification_event"] = {
+                                        "status": "pending",
+                                        "email": driver_email,
+                                        "slot_id": slot_label,
+                                        "queue_id": qid,
+                                        "timestamp": time.strftime("%H:%M:%S"),
+                                    }
+
+                                    def _make_handler(q_id_val, s_lbl, em):
+                                        def _cb(success, msg, _s, _q):
+                                            if success:
+                                                mark_driver_notified(q_id_val, s_lbl)
+                                                st.session_state["active_notification_event"] = {
+                                                    "status": "success",
+                                                    "email": em,
+                                                    "slot_id": s_lbl,
+                                                    "queue_id": q_id_val,
+                                                    "timestamp": time.strftime("%H:%M:%S"),
+                                                    "msg": msg,
+                                                }
+                                            else:
+                                                mark_driver_failed(q_id_val, msg)
+                                                st.session_state["active_notification_event"] = {
+                                                    "status": "failed",
+                                                    "email": em,
+                                                    "slot_id": s_lbl,
+                                                    "queue_id": q_id_val,
+                                                    "timestamp": time.strftime("%H:%M:%S"),
+                                                    "error": msg,
+                                                }
+                                        return _cb
+
+                                    send_parking_notification_async(
+                                        recipient_email=driver_email,
+                                        slot_id=slot_label,
+                                        queue_id=qid,
+                                        on_complete=_make_handler(qid, slot_label, driver_email),
+                                    )
+
+                        if len(recent) >= SMOOTH_WINDOW:
+                            slot_prev_status[sid] = smoothed_status
 
                     counts = count_statuses(classified)
+                    st.session_state["last_free_count"] = counts["free"]
                     with stats_placeholder.container():
                         display_stats(counts)
+
+                    waiting_now = get_waiting_count()
+                    notif_evt = st.session_state.get("active_notification_event")
+                    verified_last = get_last_successful_notification()
+
+                    with queue_summary_placeholder.container():
+                        q_info_col1, q_info_col2 = st.columns([1, 2])
+                        with q_info_col1:
+                            st.caption(f"👥 **Waiting Queue:** {waiting_now} driver(s) waiting")
+                        with q_info_col2:
+                            if notif_evt and notif_evt.get("status") == "pending":
+                                st.caption(
+                                    f"⏳ **Dispatching Email:** Notifying `{notif_evt['email']}` "
+                                    f"for **{notif_evt['slot_id']}**..."
+                                )
+                            elif notif_evt and notif_evt.get("status") == "failed":
+                                st.caption(
+                                    f"❌ **Notification Failed:** `{notif_evt['email']}`: "
+                                    f"{notif_evt['error']}"
+                                )
+                            elif notif_evt and notif_evt.get("status") == "success":
+                                st.caption(
+                                    f"🔔 **Notification Sent:** `{notif_evt['email']}` "
+                                    f"({notif_evt['queue_id']}) for **{notif_evt['slot_id']}** at {notif_evt['timestamp']}"
+                                )
+                            elif verified_last:
+                                st.caption(
+                                    f"🔔 **Last Notified:** `{verified_last['email']}` "
+                                    f"({verified_last['queue_id']}) for **{verified_last['slot_id']}** at {verified_last['timestamp']}"
+                                )
+                            else:
+                                st.caption("ℹ️ No notifications sent yet.")
 
                     result_frame = draw_results(frame, classified, vehicles, confs)
                     frame_window.image(
                         cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB),
-                        use_container_width=True,
+                        width="stretch",
                     )
                     time.sleep(0.03)
 

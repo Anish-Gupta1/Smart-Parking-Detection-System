@@ -1,0 +1,40 @@
+{
+  "queue": [
+    {
+      "queue_id": "Q-1001",
+      "email": "anish.gupta.16.02.06@gmail.com",
+      "created_at": "2026-10-10 05:11:10",
+      "status": "notified",
+      "notified_at": "2026-10-10 05:11:24",
+      "assigned_slot": "Slot #P1",
+      "error_message": null,
+      "retry_count": 0
+    },
+    {
+      "queue_id": "Q-1002",
+      "email": "anonweizly@gmail.com",
+      "created_at": "2026-10-10 05:13:34",
+      "status": "notified",
+      "notified_at": "2026-10-10 05:13:56",
+      "assigned_slot": "Slot #P1",
+      "error_message": null,
+      "retry_count": 0
+    },
+    {
+      "queue_id": "Q-1003",
+      "email": "anish.gupta.16.02.06@gmail.com",
+      "created_at": "2026-10-10 05:14:17",
+      "status": "notified",
+      "notified_at": "2026-10-10 05:14:56",
+      "assigned_slot": "Slot #P1",
+      "error_message": null,
+      "retry_count": 0
+    }
+  ],
+  "last_notified": {
+    "email": "anish.gupta.16.02.06@gmail.com",
+    "slot_id": "Slot #P1",
+    "queue_id": "Q-1003",
+    "timestamp": "2026-10-10 05:14:56"
+  }
+}

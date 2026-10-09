@@ -6,6 +6,7 @@ __pycache__/
 venv/
 env/
 .venv/
+.env
 
 # YOLO / ML
 *.pt
@@ -27,6 +28,8 @@ __pycache__/
 venv/
 .venv/
 .env
+credentials.json
+token.json
 
 # IDE and OS
 .vscode/
