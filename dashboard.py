@@ -524,56 +524,164 @@ elif mode == "Video Upload":
 # ======================================================================
 else:
     st.header("📷 Live Webcam Parking Detection")
-    st.info("Configure your parking layout on the live webcam feed.")
+    st.info("Mark your parking layout on the live webcam feed, then start real-time occupancy detection.")
 
-    run = st.checkbox("Start Live Stream")
-    if run:
-        cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    def capture_webcam_frame(device_id: int = 0, warmup_frames: int = 5):
+        """
+        Open the webcam, read warmup frames for auto-exposure & auto-white balance,
+        and return the bright, exposed frame along with dimensions.
+        """
+        cap = cv2.VideoCapture(device_id)
+        if not cap.isOpened():
+            return None, 0, 0
+        
+        frame = None
+        for _ in range(warmup_frames):
+            ret, temp_frame = cap.read()
+            if ret:
+                frame = temp_frame
+        cap.release()
+        
+        if frame is None:
+            return None, 0, 0
+        h, w = frame.shape[:2]
+        return frame, w, h
 
-        ret, first_frame = cap.read()
-        if not ret:
-            st.error("Webcam not accessible.")
+    is_confirmed_w = st.session_state.get("layout_confirmed", False)
+
+    # ── STEP A: SLOT CONFIGURATION OVER WEBCAM FEED ────────────────────
+    if not is_confirmed_w:
+        st.subheader("📐 Step 1: Mark Parking Slots on Live Webcam")
+        st.write("Draw rectangles around each parking space directly over the webcam view.")
+
+        # Capture or retrieve properly exposed reference frame
+        if "webcam_ref_frame" not in st.session_state or st.session_state["webcam_ref_frame"] is None:
+            with st.spinner("Initializing webcam and adjusting exposure..."):
+                ref_frame, w_w, w_h = capture_webcam_frame(0, warmup_frames=5)
+                if ref_frame is not None:
+                    st.session_state["webcam_ref_frame"] = ref_frame
+                    st.session_state["webcam_dims"] = (w_w, w_h)
+                else:
+                    st.session_state["webcam_ref_frame"] = None
+
+        ref_frame = st.session_state.get("webcam_ref_frame")
+
+        if ref_frame is None:
+            st.error(
+                "⚠️ Webcam not accessible. Please ensure your camera is connected and terminal/browser "
+                "has camera permissions in macOS System Settings > Privacy & Security > Camera."
+            )
+            if st.button("🔄 Retry Camera Connection"):
+                st.session_state["webcam_ref_frame"] = None
+                st.rerun()
         else:
-            w_h, w_w = first_frame.shape[:2]
+            w_w, w_h = st.session_state.get("webcam_dims", (ref_frame.shape[1], ref_frame.shape[0]))
             display_h = int(DISPLAY_W * w_h / w_w)
-            bg = Image.fromarray(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)).resize(
-                (DISPLAY_W, display_h)
+            bg = Image.fromarray(cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB)).resize((DISPLAY_W, display_h))
+
+            # Controls above canvas
+            col_ctrl_w1, col_ctrl_w2 = st.columns([1, 1])
+            with col_ctrl_w1:
+                if st.button("📸 Grab Fresh Camera Frame"):
+                    with st.spinner("Grabbing new frame from camera..."):
+                        new_frame, nw_w, nw_h = capture_webcam_frame(0, warmup_frames=5)
+                        if new_frame is not None:
+                            st.session_state["webcam_ref_frame"] = new_frame
+                            st.session_state["webcam_dims"] = (nw_w, nw_h)
+                            st.rerun()
+            with col_ctrl_w2:
+                if st.button("🔄 Clear Drawn Slots"):
+                    st.session_state["in_progress_slots_w"] = []
+                    st.session_state["confirmed_slots"] = []
+                    st.rerun()
+
+            # Pre-populate existing slots if any
+            current_slots_w = st.session_state.get("confirmed_slots", [])
+            initial_drawing_w = None
+            if current_slots_w:
+                initial_objects_w = [
+                    {
+                        "type": "Rect",
+                        "left": s["x_norm"] * DISPLAY_W,
+                        "top": s["y_norm"] * display_h,
+                        "width": s["w_norm"] * DISPLAY_W,
+                        "height": s["h_norm"] * display_h,
+                        "fill": "rgba(0, 200, 0, 0.15)",
+                        "stroke": "#00C800",
+                        "strokeWidth": 2,
+                    }
+                    for s in current_slots_w
+                ]
+                initial_drawing_w = {"version": "5.3.0", "objects": initial_objects_w}
+
+            canvas_w = st_canvas(
+                fill_color="rgba(0, 200, 0, 0.15)",
+                stroke_width=2,
+                stroke_color="#00C800",
+                background_image=bg,
+                drawing_mode="rect",
+                height=display_h,
+                width=DISPLAY_W,
+                initial_drawing=initial_drawing_w,
+                key="webcam_canvas",
             )
 
-            is_confirmed_w = st.session_state.get("layout_confirmed", False)
+            drawn_slots_w = canvas_to_normalized_slots(
+                canvas_w, DISPLAY_W, display_h, w_w, w_h
+            )
+            if drawn_slots_w:
+                st.session_state["in_progress_slots_w"] = drawn_slots_w
 
-            if not is_confirmed_w:
-                st.subheader("📐 Mark Parking Slots on Webcam Stream")
-                canvas_w = st_canvas(
-                    fill_color="rgba(0, 200, 0, 0.15)",
-                    stroke_width=2,
-                    stroke_color="#00C800",
-                    background_image=bg,
-                    drawing_mode="rect",
-                    height=display_h,
-                    width=DISPLAY_W,
-                    key="webcam_canvas",
-                )
+            active_slots_w = drawn_slots_w or st.session_state.get("in_progress_slots_w", [])
 
-                drawn_slots_w = canvas_to_normalized_slots(
+            if active_slots_w:
+                st.info(f"✨ **{len(active_slots_w)} slot(s) drawn** on webcam feed. Click **Confirm** when done.")
+            else:
+                st.caption("No slots drawn yet. Click and drag to create rectangles over parking spaces.")
+
+            if st.button("✅ Confirm Webcam Layout", type="primary"):
+                to_confirm = active_slots_w or canvas_to_normalized_slots(
                     canvas_w, DISPLAY_W, display_h, w_w, w_h
                 )
-                if st.button("✅ Confirm Webcam Layout", type="primary"):
-                    if drawn_slots_w:
-                        st.session_state["confirmed_slots"] = drawn_slots_w
-                        st.session_state["layout_confirmed"] = True
-                        st.rerun()
-                    else:
-                        st.warning("Draw parking slots before confirming.")
+                if to_confirm:
+                    st.session_state["confirmed_slots"] = to_confirm
+                    st.session_state["layout_confirmed"] = True
+                    st.success(f"✅ Layout confirmed with {len(to_confirm)} parking spaces!")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ Please draw at least one slot before confirming.")
+
+    # ── STEP B: CONTINUOUS LIVE DETECTION ──────────────────────────────
+    else:
+        confirmed_slots_w = st.session_state.get("confirmed_slots", [])
+        st.subheader("▶️ Step 2: Live Webcam Occupancy Detection")
+
+        col_w_btn1, col_w_btn2 = st.columns([1, 1])
+        with col_w_btn1:
+            if st.button("📝 Edit / Redraw Layout"):
+                st.session_state["layout_confirmed"] = False
+                st.rerun()
+        with col_w_btn2:
+            if st.button("🗑️ Reset Webcam Layout"):
+                st.session_state["confirmed_slots"] = []
+                st.session_state["layout_confirmed"] = False
+                st.session_state["webcam_ref_frame"] = None
+                st.rerun()
+
+        st.markdown("---")
+        run_stream = st.checkbox("▶️ Run Live Detection Stream", value=True)
+
+        if run_stream:
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            ret, test_frame = cap.read()
+            if not ret:
+                st.error("Cannot access live webcam stream.")
                 cap.release()
             else:
-                confirmed_slots_w = st.session_state.get("confirmed_slots", [])
+                w_h, w_w = test_frame.shape[:2]
                 slots_px = slots_to_pixels(confirmed_slots_w, w_w, w_h)
-
-                if st.button("📝 Edit Layout"):
-                    st.session_state["layout_confirmed"] = False
-                    st.rerun()
 
                 stats_placeholder = st.empty()
                 frame_window = st.image([])
@@ -585,7 +693,7 @@ else:
                 status_history = {s["id"]: [] for s in slots_px}
                 SMOOTH_WINDOW = 3
 
-                while run:
+                while run_stream:
                     ret, frame = cap.read()
                     if not ret:
                         break
@@ -615,6 +723,7 @@ else:
                         enable_secondary=secondary_classifier,
                     )
 
+                    # Temporal smoothing to prevent flicker
                     for s in classified:
                         sid = s["id"]
                         status_history[sid].append(s["status"])
