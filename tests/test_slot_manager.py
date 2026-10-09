@@ -189,6 +189,28 @@ def test_canvas_to_normalized_slots():
     print("✅ test_canvas_to_normalized_slots passed")
 
 
+def test_compute_overlap_metrics():
+    """Verify slot overlap ratio and vehicle overlap ratio."""
+    from slot_manager import compute_overlap_metrics
+    slot = (0, 0, 100, 100)        # area = 10000
+    veh = (50, 0, 150, 100)        # area = 10000, inter = 5000
+    m = compute_overlap_metrics(slot, veh)
+    assert m["slot_overlap_ratio"] == 0.5, f"Expected 0.5, got {m['slot_overlap_ratio']}"
+    assert m["vehicle_overlap_ratio"] == 0.5, f"Expected 0.5, got {m['vehicle_overlap_ratio']}"
+    assert round(m["iou"], 4) == round(5000 / 15000, 4)
+    print("✅ test_compute_overlap_metrics passed")
+
+
+def test_analyze_slot_crop():
+    """Verify crop feature extractor produces scores in [0, 1]."""
+    from slot_manager import analyze_slot_crop
+    import numpy as np
+    blank = np.zeros((100, 100, 3), dtype=np.uint8)
+    res = analyze_slot_crop(blank)
+    assert 0.0 <= res["occupied_score"] <= 1.0
+    print("✅ test_analyze_slot_crop passed")
+
+
 if __name__ == "__main__":
     test_iou_no_overlap()
     test_iou_perfect_overlap()
@@ -202,4 +224,6 @@ if __name__ == "__main__":
     test_layout_persistence()
     test_slots_to_pixels()
     test_canvas_to_normalized_slots()
+    test_compute_overlap_metrics()
+    test_analyze_slot_crop()
     print("\n🎉 All tests passed!")

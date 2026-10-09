@@ -1,23 +1,24 @@
 """
 Parking Slot Manager
 - Persistent layout storage (JSON files)
-- IoU-based vehicle-to-slot matching
+- Advanced geometric slot-to-vehicle overlap analysis (slot overlap, vehicle overlap, IoU)
+- Exclusive vehicle-to-slot matching preventing false adjacent-slot occupancy
+- Secondary slot-crop visual analysis for vehicles missed by YOLO
 - Three-state occupancy classification: free / occupied / uncertain
 """
 
 import json
 import os
-import hashlib
+import cv2
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Configuration defaults (can be overridden per-call)
+# Configuration defaults
 # ---------------------------------------------------------------------------
-DEFAULT_OCCUPIED_IOU = 0.15       # IoU >= this → occupied
-DEFAULT_UNCERTAIN_IOU = 0.05      # IoU >= this but < occupied → uncertain
+DEFAULT_OCCUPIED_OVERLAP = 0.15   # Overlap ratio >= this → occupied
+DEFAULT_UNCERTAIN_OVERLAP = 0.05  # Overlap ratio >= this but < occupied → uncertain
 LAYOUTS_DIR = os.path.join(os.path.dirname(__file__), "layouts")
 
-# Ensure layouts directory exists
 os.makedirs(LAYOUTS_DIR, exist_ok=True)
 
 
@@ -31,20 +32,7 @@ def _layout_path(layout_name: str) -> str:
 
 
 def save_layout(layout_name: str, slots: list[dict]) -> str:
-    """
-    Save a list of slot dicts to a JSON file.
-
-    Each slot dict:
-        {
-            "id": "P1",
-            "x_norm": float,   # 0-1, relative to image width
-            "y_norm": float,
-            "w_norm": float,
-            "h_norm": float,
-        }
-
-    Returns the path written.
-    """
+    """Save a list of slot dicts to a JSON file."""
     path = _layout_path(layout_name)
     with open(path, "w") as f:
         json.dump({"slots": slots}, f, indent=2)
@@ -52,7 +40,7 @@ def save_layout(layout_name: str, slots: list[dict]) -> str:
 
 
 def load_layout(layout_name: str) -> list[dict] | None:
-    """Load saved slots for a layout.  Returns None if not found."""
+    """Load saved slots for a layout. Returns None if not found."""
     path = _layout_path(layout_name)
     if not os.path.exists(path):
         return None
@@ -62,7 +50,7 @@ def load_layout(layout_name: str) -> list[dict] | None:
 
 
 def delete_layout(layout_name: str) -> bool:
-    """Delete a saved layout.  Returns True if file existed."""
+    """Delete a saved layout. Returns True if file existed."""
     path = _layout_path(layout_name)
     if os.path.exists(path):
         os.remove(path)
@@ -73,13 +61,19 @@ def delete_layout(layout_name: str) -> bool:
 def list_layouts() -> list[str]:
     """Return names of all saved layouts."""
     layouts = []
-    for f in os.listdir(LAYOUTS_DIR):
-        if f.endswith(".json"):
-            layouts.append(f[:-5])
+    if os.path.exists(LAYOUTS_DIR):
+        for f in os.listdir(LAYOUTS_DIR):
+            if f.endswith(".json"):
+                layouts.append(f[:-5])
     return sorted(layouts)
 
 
-def canvas_to_normalized_slots(canvas_result, canvas_w: int, canvas_h: int, img_w: int, img_h: int) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Canvas to Normalized Slots
+# ---------------------------------------------------------------------------
+def canvas_to_normalized_slots(
+    canvas_result, canvas_w: int, canvas_h: int, img_w: int, img_h: int
+) -> list[dict]:
     """
     Extract rectangle objects from the drawable canvas and convert
     to normalized slot dicts. Supports Fabric.js v5 ('rect') and v6 ('Rect'),
@@ -102,14 +96,12 @@ def canvas_to_normalized_slots(canvas_result, canvas_w: int, canvas_h: int, img_
     idx = 1
     for obj in objects:
         obj_type = str(obj.get("type", "")).lower()
-        # Accept 'rect', 'labeledrect', or any shape with bounding box width/height
         if "rect" in obj_type or ("width" in obj and "height" in obj):
             left = float(obj.get("left", 0))
             top = float(obj.get("top", 0))
             width = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
             height = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
 
-            # Handle negative width/height if dragged right-to-left or bottom-to-top
             if width < 0:
                 left += width
                 width = abs(width)
@@ -117,7 +109,6 @@ def canvas_to_normalized_slots(canvas_result, canvas_w: int, canvas_h: int, img_
                 top += height
                 height = abs(height)
 
-            # Ignore tiny clicks/accidental dots (< 5px)
             if width < 5 or height < 5:
                 continue
 
@@ -126,7 +117,6 @@ def canvas_to_normalized_slots(canvas_result, canvas_w: int, canvas_h: int, img_
             w_px = width * scale_x
             h_px = height * scale_y
 
-            # Clamp normalized coordinates to [0.0, 1.0]
             x_norm = max(0.0, min(1.0, x_px / img_w))
             y_norm = max(0.0, min(1.0, y_px / img_h))
             w_norm = max(0.0, min(1.0 - x_norm, w_px / img_w))
@@ -157,7 +147,6 @@ def slots_to_pixels(slots: list[dict], img_w: int, img_h: int) -> list[dict]:
             "y": int(s["y_norm"] * img_h),
             "w": int(s["w_norm"] * img_w),
             "h": int(s["h_norm"] * img_h),
-            # keep normalised too
             "x_norm": s["x_norm"],
             "y_norm": s["y_norm"],
             "w_norm": s["w_norm"],
@@ -168,148 +157,271 @@ def slots_to_pixels(slots: list[dict], img_w: int, img_h: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# IoU computation
+# Geometric overlap calculations
 # ---------------------------------------------------------------------------
+def compute_overlap_metrics(slot_box: tuple, vehicle_box: tuple) -> dict:
+    """
+    Calculate comprehensive overlap metrics between a slot and vehicle:
+      - slot_overlap_ratio: intersection_area / slot_area
+      - vehicle_overlap_ratio: intersection_area / vehicle_area
+      - iou: intersection_area / union_area
+      - center_inside: whether vehicle center is inside the slot
+    """
+    s_x1, s_y1, s_x2, s_y2 = slot_box
+    v_x1, v_y1, v_x2, v_y2 = vehicle_box
+
+    inter_x1 = max(s_x1, v_x1)
+    inter_y1 = max(s_y1, v_y1)
+    inter_x2 = min(s_x2, v_x2)
+    inter_y2 = min(s_y2, v_y2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = float(inter_w * inter_h)
+
+    slot_area = float(max(1, (s_x2 - s_x1) * (s_y2 - s_y1)))
+    veh_area = float(max(1, (v_x2 - v_x1) * (v_y2 - v_y1)))
+    union_area = float(slot_area + veh_area - inter_area)
+
+    slot_overlap_ratio = inter_area / slot_area
+    vehicle_overlap_ratio = inter_area / veh_area
+    iou = inter_area / union_area if union_area > 0 else 0.0
+
+    # Center check
+    v_cx = (v_x1 + v_x2) / 2.0
+    v_cy = (v_y1 + v_y2) / 2.0
+    center_inside = (s_x1 <= v_cx <= s_x2) and (s_y1 <= v_cy <= s_y2)
+
+    return {
+        "inter_area": inter_area,
+        "slot_overlap_ratio": slot_overlap_ratio,
+        "vehicle_overlap_ratio": vehicle_overlap_ratio,
+        "iou": iou,
+        "center_inside": center_inside,
+    }
+
+
 def _iou(boxA: tuple, boxB: tuple) -> float:
-    """
-    Compute Intersection-over-Union for two (x1, y1, x2, y2) boxes.
-    Returns 0.0 – 1.0.
-    """
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    if inter == 0:
-        return 0.0
-
-    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    union = areaA + areaB - inter
-
-    return inter / union if union > 0 else 0.0
+    """Legacy helper for IoU."""
+    m = compute_overlap_metrics(boxA, boxB)
+    return m["iou"]
 
 
 def _overlap_ratio(slot_box: tuple, vehicle_box: tuple) -> float:
-    """
-    Compute what fraction of the *slot* area is covered by the vehicle box.
-    This is more useful than IoU for small slots under large vehicles.
-    """
-    xA = max(slot_box[0], vehicle_box[0])
-    yA = max(slot_box[1], vehicle_box[1])
-    xB = min(slot_box[2], vehicle_box[2])
-    yB = min(slot_box[3], vehicle_box[3])
-
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    if inter == 0:
-        return 0.0
-
-    slot_area = (slot_box[2] - slot_box[0]) * (slot_box[3] - slot_box[1])
-    return inter / slot_area if slot_area > 0 else 0.0
+    """Legacy helper for slot overlap ratio."""
+    m = compute_overlap_metrics(slot_box, vehicle_box)
+    return m["slot_overlap_ratio"]
 
 
 # ---------------------------------------------------------------------------
-# Occupancy classification
+# Secondary Slot-Crop Occupancy Classifier
+# ---------------------------------------------------------------------------
+def analyze_slot_crop(crop: np.ndarray) -> dict:
+    """
+    Secondary occupancy classifier analyzing the image crop of a configured slot.
+    Evaluates edge complexity, gradient distribution, and chromatic saturation.
+    Prevents false-free classifications when YOLO misses a vehicle.
+    """
+    if crop is None or crop.size < 100:
+        return {"occupied_score": 0.0, "is_occupied": False, "reason": "empty_crop"}
+
+    try:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        # 1. Edge complexity using Sobel
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+        edge_mean = float(np.mean(grad_mag))
+
+        # 2. Structural texture variance (Laplacian)
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+        # 3. Color saturation and value variance
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        sat_mean = float(np.mean(hsv[:, :, 1]))
+        val_std = float(np.std(hsv[:, :, 2]))
+
+        # Normalized feature components
+        edge_score = min(1.0, edge_mean / 40.0)
+        lap_score = min(1.0, lap_var / 120.0)
+        color_score = min(1.0, (sat_mean / 25.0) + (val_std / 50.0))
+
+        # Combined occupancy score [0.0, 1.0]
+        occupied_score = 0.40 * edge_score + 0.30 * lap_score + 0.30 * color_score
+        is_occupied = occupied_score >= 0.65
+
+        return {
+            "occupied_score": round(occupied_score, 3),
+            "is_occupied": is_occupied,
+            "edge_mean": round(edge_mean, 1),
+            "lap_var": round(lap_var, 1),
+            "sat_mean": round(sat_mean, 1),
+        }
+    except Exception:
+        return {"occupied_score": 0.0, "is_occupied": False, "reason": "analysis_error"}
+
+
+# ---------------------------------------------------------------------------
+# Occupancy classification engine
 # ---------------------------------------------------------------------------
 def classify_slots(
     slots_px: list[dict],
     vehicles: list[tuple],
     vehicle_confs: list[float] | None = None,
-    occupied_threshold: float = DEFAULT_OCCUPIED_IOU,
-    uncertain_threshold: float = DEFAULT_UNCERTAIN_IOU,
+    frame: np.ndarray | None = None,
+    occupied_threshold: float = DEFAULT_OCCUPIED_OVERLAP,
+    uncertain_threshold: float = DEFAULT_UNCERTAIN_OVERLAP,
+    enable_secondary: bool = True,
 ) -> list[dict]:
     """
-    Classify each slot as 'free', 'occupied', or 'uncertain'.
+    Classify each parking slot as 'free', 'occupied', or 'uncertain'.
 
     Parameters
     ----------
-    slots_px : list of dicts with pixel keys  (x, y, w, h, id)
+    slots_px : list of slot dicts with pixel coords (x, y, w, h, id)
     vehicles : list of (x1, y1, x2, y2) vehicle bounding boxes
-    vehicle_confs : optional list of confidence scores parallel to vehicles
+    vehicle_confs : list of confidence scores for each vehicle
+    frame : optional full-resolution BGR frame for secondary crop classification
     occupied_threshold : minimum overlap ratio to declare occupied
     uncertain_threshold : minimum overlap ratio to declare uncertain
+    enable_secondary : whether to use secondary crop classification when YOLO misses
 
     Returns
     -------
-    list of dicts: each slot dict augmented with:
+    list of dicts: augmented slot dicts with:
         "status" : "free" | "occupied" | "uncertain"
-        "best_overlap" : float
+        "best_overlap" : float (slot overlap ratio)
         "best_vehicle_conf" : float or None
+        "evidence" : str explanation
     """
     if vehicle_confs is None:
         vehicle_confs = [1.0] * len(vehicles)
 
-    # Track which vehicles have already been matched to a slot
-    # (prevents one vehicle from occupying multiple adjacent slots)
-    vehicle_assigned = [False] * len(vehicles)
+    num_slots = len(slots_px)
+    num_vehicles = len(vehicles)
 
-    # First pass: compute best overlap for each slot
-    slot_results = []
+    # 1. Compute pairwise metrics between all slots and vehicles
+    # metrics_matrix[s_idx][v_idx]
+    metrics_matrix = []
     for s in slots_px:
-        slot_box = (s["x"], s["y"], s["x"] + s["w"], s["y"] + s["h"])
+        s_box = (s["x"], s["y"], s["x"] + s["w"], s["y"] + s["h"])
+        row = []
+        for v_box in vehicles:
+            row.append(compute_overlap_metrics(s_box, v_box))
+        metrics_matrix.append(row)
+
+    # 2. Optimal Vehicle-to-Slot Matching
+    # Each vehicle should primarily occupy its best matching slot.
+    # To handle genuine double-parking, a vehicle can occupy multiple slots
+    # ONLY if its vehicle_overlap_ratio on both slots is >= 0.35.
+    vehicle_primary_slot: dict[int, int] = {}
+    DOUBLE_PARK_VEH_THRESHOLD = 0.35
+
+    for v_idx in range(num_vehicles):
+        best_s = -1
+        best_metric_val = -1.0
+        for s_idx in range(num_slots):
+            m = metrics_matrix[s_idx][v_idx]
+            # Primary criterion: slot_overlap_ratio + IoU
+            score = m["slot_overlap_ratio"] + (0.5 * m["iou"])
+            if score > best_metric_val:
+                best_metric_val = score
+                best_s = s_idx
+        if best_metric_val > 0.05 and best_s != -1:
+            vehicle_primary_slot[v_idx] = best_s
+
+    # 3. Classify each slot
+    classified_results = []
+    frame_h, frame_w = (frame.shape[:2] if frame is not None else (0, 0))
+
+    for s_idx, s in enumerate(slots_px):
         best_overlap = 0.0
+        best_v_overlap = 0.0
         best_iou = 0.0
         best_conf = 0.0
         best_v_idx = -1
+        primary_match = False
 
-        for v_idx, (v_box, v_conf) in enumerate(zip(vehicles, vehicle_confs)):
-            iou = _iou(slot_box, v_box)
-            overlap = _overlap_ratio(slot_box, v_box)
-            # Use the max of IoU and overlap_ratio for matching
-            score = max(iou, overlap)
+        for v_idx in range(num_vehicles):
+            m = metrics_matrix[s_idx][v_idx]
+            overlap = m["slot_overlap_ratio"]
+            v_overlap = m["vehicle_overlap_ratio"]
+            conf = vehicle_confs[v_idx]
 
-            if score > best_overlap:
-                best_overlap = score
-                best_iou = iou
-                best_conf = v_conf
+            is_primary = (vehicle_primary_slot.get(v_idx) == s_idx)
+            is_genuine_double = (v_overlap >= DOUBLE_PARK_VEH_THRESHOLD)
+
+            # If vehicle belongs to another slot and merely clipped this slot border,
+            # do not let it falsely occupy this slot.
+            if not is_primary and not is_genuine_double:
+                continue
+
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_v_overlap = v_overlap
+                best_iou = m["iou"]
+                best_conf = conf
                 best_v_idx = v_idx
+                primary_match = is_primary
 
-        slot_results.append({
+        status = "free"
+        evidence = "No vehicle detected"
+
+        # Check YOLO overlap evidence
+        if best_overlap >= occupied_threshold and best_v_idx >= 0:
+            status = "occupied"
+            evidence = f"YOLO vehicle match (overlap: {best_overlap:.1%}, conf: {best_conf:.0%})"
+        elif best_overlap >= uncertain_threshold and best_v_idx >= 0:
+            status = "uncertain"
+            evidence = f"Borderline overlap ({best_overlap:.1%})"
+        else:
+            # 4. Secondary Crop Classifier (when YOLO didn't detect an overlapping vehicle)
+            if frame is not None and enable_secondary:
+                sx = max(0, min(frame_w - 1, s["x"]))
+                sy = max(0, min(frame_h - 1, s["y"]))
+                sw = max(1, min(frame_w - sx, s["w"]))
+                sh = max(1, min(frame_h - sy, s["h"]))
+                crop = frame[sy:sy + sh, sx:sx + sw]
+
+                crop_analysis = analyze_slot_crop(crop)
+                c_score = crop_analysis.get("occupied_score", 0.0)
+
+                if c_score >= 0.70:
+                    status = "occupied"
+                    evidence = f"Secondary classifier: vehicle texture detected (score: {c_score:.2f})"
+                elif c_score >= 0.52:
+                    status = "uncertain"
+                    evidence = f"Secondary classifier: ambiguous pattern (score: {c_score:.2f})"
+                else:
+                    status = "free"
+                    evidence = "Confirmed empty pavement"
+            else:
+                status = "free"
+                evidence = "No vehicle overlap"
+
+        classified_results.append({
             **s,
+            "status": status,
             "best_overlap": best_overlap,
-            "best_iou": best_iou,
-            "best_vehicle_conf": best_conf,
-            "best_v_idx": best_v_idx,
+            "veh_overlap": best_v_overlap,
+            "best_vehicle_conf": best_conf if best_v_idx >= 0 else None,
+            "evidence": evidence,
         })
 
-    # Sort by best_overlap descending so the strongest matches get assigned first
-    indexed = list(enumerate(slot_results))
-    indexed.sort(key=lambda x: x[1]["best_overlap"], reverse=True)
-
-    for orig_idx, sr in indexed:
-        v_idx = sr["best_v_idx"]
-        overlap = sr["best_overlap"]
-
-        if overlap >= occupied_threshold and v_idx >= 0 and not vehicle_assigned[v_idx]:
-            sr["status"] = "occupied"
-            vehicle_assigned[v_idx] = True
-        elif overlap >= uncertain_threshold:
-            # Could be occupied but the evidence is weak, or vehicle already assigned
-            if v_idx >= 0 and vehicle_assigned[v_idx]:
-                # Vehicle already matched to a better slot
-                sr["status"] = "uncertain"
-            else:
-                sr["status"] = "uncertain"
-        else:
-            sr["status"] = "free"
-
-    # Restore original order
-    result = [None] * len(slot_results)
-    for orig_idx, sr in indexed:
-        # Remove internal fields
-        sr.pop("best_v_idx", None)
-        sr.pop("best_iou", None)
-        result[orig_idx] = sr
-
-    return result
+    return classified_results
 
 
 def count_statuses(classified: list[dict]) -> dict:
-    """Return a summary dict of status counts."""
+    """
+    Return a summary dict of status counts.
+    Strict invariant: total = free + occupied + uncertain.
+    """
     counts = {"total": len(classified), "free": 0, "occupied": 0, "uncertain": 0}
     for s in classified:
         status = s.get("status", "uncertain")
-        if status in counts:
+        if status in ("free", "occupied", "uncertain"):
             counts[status] += 1
+        else:
+            counts["uncertain"] += 1
     return counts
