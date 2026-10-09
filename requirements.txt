@@ -1,3 +1,6 @@
 opencv-python
 ultralytics
 numpy
+streamlit
+streamlit-drawable-canvas
+pillow

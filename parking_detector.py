@@ -20,17 +20,35 @@ def box_overlap(boxA, boxB):
     return xA < xB and yA < yB
 
 
-def detect_vehicles(frame, conf_thres=0.25):
-    """Detect vehicles and return their (x1, y1, x2, y2) boxes."""
+def detect_vehicles(frame, conf_thres=0.20, imgsz=1280):
+    """
+    Detect vehicles and return (boxes, confidences).
+
+    Parameters
+    ----------
+    frame : np.ndarray
+        BGR image at *original* resolution (do NOT pre-shrink).
+    conf_thres : float
+        Minimum confidence threshold (lowered from 0.25 to catch more cars).
+    imgsz : int
+        YOLO inference resolution. Higher = better detection of small cars
+        in aerial views, but slower.  1280 is a good balance.
+
+    Returns
+    -------
+    vehicles : list of (x1, y1, x2, y2) in the frame's coordinate space
+    confidences : list of float, parallel to vehicles
+    """
     results = model.predict(
         source=frame,
         conf=conf_thres,
-        imgsz=960,
+        imgsz=imgsz,
         verbose=False,
         device=DEVICE,
     )
 
     vehicles = []
+    confidences = []
 
     for result in results:
         for box in result.boxes:
@@ -40,6 +58,14 @@ def detect_vehicles(frame, conf_thres=0.25):
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            conf = float(box.conf[0])
             vehicles.append((x1, y1, x2, y2))
+            confidences.append(conf)
 
+    return vehicles, confidences
+
+
+def detect_vehicles_legacy(frame, conf_thres=0.25):
+    """Legacy wrapper that returns only boxes (for backward compat)."""
+    vehicles, _ = detect_vehicles(frame, conf_thres=conf_thres)
     return vehicles
