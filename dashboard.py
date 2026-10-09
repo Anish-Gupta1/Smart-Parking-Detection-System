@@ -1,11 +1,11 @@
 import streamlit as st
 import cv2
+import numpy as np
 import tempfile
 import time
 
-from detector.auto_slot_detector import auto_detect_slots
-from detector.parking_detector import detect_vehicles, box_overlap
-
+from auto_slot_detector import auto_detect_slots
+from parking_detector import detect_vehicles, box_overlap
 st.set_page_config(page_title="Smart Parking System", layout="wide")
 
 st.title("🚗 Smart Parking Detection System")
