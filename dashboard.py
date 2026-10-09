@@ -57,7 +57,7 @@ if mode == "Image Upload":
             cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
 
         st.success(f"Free Slots: {free}")
-        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_column_width=True)
+        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width="stretch")
 
 # ======================================================
 # 🎥 VIDEO MODE
@@ -120,7 +120,7 @@ elif mode == "Video Upload":
 
                 frame_window.image(
                     cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    use_column_width=True
+                    width="stretch"
                 )
 
                 time.sleep(0.03)
@@ -183,7 +183,7 @@ else:
 
                 frame_window.image(
                     cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    use_column_width=True
+                    width="stretch"
                 )
 
                 time.sleep(0.03)

@@ -1,3 +1,4 @@
+
 from ultralytics import YOLO
 import torch
 
@@ -6,32 +7,39 @@ print(f"[INFO] Using device: {DEVICE}")
 
 model = YOLO("yolov8n.pt").to(DEVICE)
 
-VEHICLE_CLASSES = ["car", "truck", "bus", "motorbike"]
-
+VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle"}
 
 
 def box_overlap(boxA, boxB):
+    """Return True when two bounding boxes intersect."""
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
     yB = min(boxA[3], boxB[3])
+
     return xA < xB and yA < yB
 
 
-def detect_vehicles(frame, conf_thres=0.5):
-    vehicles = []
-    results = model(frame, stream=True)
+def detect_vehicles(frame, conf_thres=0.25):
+    """Detect vehicles and return their (x1, y1, x2, y2) boxes."""
+    results = model.predict(
+        source=frame,
+        conf=conf_thres,
+        imgsz=960,
+        verbose=False,
+        device=DEVICE,
+    )
 
-    for r in results:
-        for box in r.boxes:
-            if box.conf[0] < conf_thres:
+    vehicles = []
+
+    for result in results:
+        for box in result.boxes:
+            cls = int(box.cls[0])
+
+            if model.names[cls] not in VEHICLE_CLASSES:
                 continue
 
-            cls = int(box.cls[0])
-            label = model.names[cls]
-
-            if label in VEHICLE_CLASSES:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                vehicles.append((x1, y1, x2, y2))
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            vehicles.append((x1, y1, x2, y2))
 
     return vehicles
